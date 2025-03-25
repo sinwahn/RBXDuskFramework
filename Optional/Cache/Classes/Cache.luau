@@ -19,7 +19,7 @@ local Cache = {} do
 		self._InUseNextPosition = 0
 	end
 	
-	function Cache:Destroy()
+	function Cache:destructor()
 		for _, item in next, self._Stored do
 			item:Destroy()
 		end

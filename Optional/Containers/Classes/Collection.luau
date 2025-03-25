@@ -5,7 +5,7 @@ local Collection = {} do
 		self.Size = 0
 	end
 	
-	function Collection:Destroy()
+	function Collection:destructor()
 		table.clear(self.Items)
 	end
 	

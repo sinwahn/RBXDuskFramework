@@ -12,9 +12,8 @@ local CCache = {} do
 		self._Cleaner = expecttype(cleaner, "function")
 	end
 	
-	local CacheStore = Cache.Store
 	function CCache:Store(item)
-		CacheStore(self, item)
+		Cache.Store(self, item)
 		self._Cleaner(item)
 	end
 	

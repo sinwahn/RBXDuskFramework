@@ -24,7 +24,7 @@ end
 
 local Module = {} do
 	Module.__index = Module
-	
+
 	function Module.new(module : ModuleScript)
 		local self = setmetatable({}, Module)
 		self.Name = module.Name
@@ -43,7 +43,7 @@ local Module = {} do
 		if type(result) ~= "table" then
 			error(`expected 'table' value to be returned, got '{type(result)}'\nfrom module '{self._Instance:GetFullName()}'`)
 		end
-		
+
 		self._ReturnValue = result
 		self._IsInitialized = true
 		return result
@@ -53,7 +53,7 @@ end
 
 local ModuleCollector = {} do
 	ModuleCollector.__index = ModuleCollector
-	
+
 	function ModuleCollector.new()
 		local self = setmetatable({}, ModuleCollector)
 		self.CollectedModules = {}
@@ -107,7 +107,7 @@ end
 
 local ClassModule = setmetatable({}, Module) do
 	ClassModule.__index = ClassModule
-	
+
 	function ClassModule.new(module : ModuleScript, fullName : string)
 		local self = setmetatable(Module.new(module), ClassModule)
 		expecttype(fullName, "string")
@@ -130,7 +130,7 @@ end
 
 local Package = setmetatable({}, ModuleCollector) do
 	Package.__index = Package
-	
+
 	function Package.new(packageManager, folder, name, prefixName)
 		local self = setmetatable(ModuleCollector.new(), Package)
 
@@ -143,7 +143,7 @@ local Package = setmetatable({}, ModuleCollector) do
 		self._EnumsModule = nil
 		self._ModuleNameToImplementation = {}
 		self._Packages = {}
-		
+
 		return self
 	end
 
@@ -219,6 +219,10 @@ local Package = setmetatable({}, ModuleCollector) do
 			self:AddModule(fileName, module)
 			self._PackageManager:RegisterClass(fullName, module)
 		end
+	end
+
+	function Package:FindSubPackage(name)
+		return self._Packages[name]
 	end
 
 	function Package:RegisterSubPackage(package)
@@ -328,23 +332,26 @@ end
 
 local PackageManager = {} do
 	PackageManager.__index = PackageManager
-	
+
 	function PackageManager.new(classesFolders, mainScript)
 		local self = setmetatable({}, PackageManager)
-		
+
 		self.Packages = {}
 		self.Classes = {}
 		self.Enums = {}
 
-		local rootFolderNames = {}
-		for _, folder in next, classesFolders do
-			rootFolderNames[folder.Name] = 1
+		local rootFolderPaths = {}
+		for i, folder in next, classesFolders do
+			expectrbxtype(folder, "Instance")
+			rootFolderPaths[i] = folder:GetFullName()
 		end
 
-		self.RootFolderNames = rootFolderNames
-		self.MainScriptName = mainScript.Name
+		self.RootFolderPaths = rootFolderPaths
+
+		expectrbxtype(mainScript, "Instance")
+		self.MainScriptPath = mainScript:GetFullName()
 		self.RootPackage = nil
-		
+
 		return self
 	end
 
@@ -359,12 +366,12 @@ local PackageManager = {} do
 	end
 
 	-- ".class" aka "relative path" syntax support
-	function PackageManager:PathToFullName(path : string, localClassTraceOffset)
+	function PackageManager:PathToFullName(path : string, apiCallTraceOffset)
 		if string.sub(path, 1, 1) ~= '.' then
 			return path
 		end
 
-		local package = self:_GetLocalPackage(localClassTraceOffset + 1)
+		local package = self:_GetLocalPackage(apiCallTraceOffset + 1)
 		if package == self.RootPackage then
 			-- cannot have dot as first symbol in root
 			return string.sub(path, 2, -1)
@@ -373,8 +380,8 @@ local PackageManager = {} do
 		return package.FullName .. path
 	end
 
-	function PackageManager:GetClass(path : string, localClassTraceOffset)
-		local fullName = self:PathToFullName(path, localClassTraceOffset + 1)
+	function PackageManager:GetClass(path : string, apiCallTraceOffset)
+		local fullName = self:PathToFullName(path, apiCallTraceOffset + 1)
 
 		local classModule = self.Classes[fullName]
 		if not classModule then
@@ -386,12 +393,12 @@ local PackageManager = {} do
 				errorf("'%s' is invalid class module full name", fullName)
 			end
 		end
-		
+
 		return classModule:GetReturnValueAsClass()
 	end
 
-	function PackageManager:GetEnum(path : string, localClassTraceOffset)
-		local fullName = self:PathToFullName(path, localClassTraceOffset + 1)
+	function PackageManager:GetEnum(path : string, apiCallTraceOffset)
+		local fullName = self:PathToFullName(path, apiCallTraceOffset + 1)
 
 		local enums = self.Enums[fullName]
 		if not enums then
@@ -411,7 +418,7 @@ local PackageManager = {} do
 		expecttype(name, "string")
 		expecttype(prefixName, "string")
 		local package = Package.new(self, folder, name, prefixName)
-		self.Packages[name] = package
+		table.insert(self.Packages, package)
 		return package
 	end
 
@@ -421,68 +428,60 @@ local PackageManager = {} do
 		return root
 	end
 
-	function PackageManager:GetPackage(name, noThrow)
-		local package = self.Packages[name]
-		if package then
-			return package
-		end
-
-		if not noThrow then
-			errorf("'%s' is invalid package name", name)
-		end
-	end
-
-	function PackageManager:_GetLocalPackage(localClassTraceOffset)
-		local rootFolderNames = self.RootFolderNames
-
-		local trace = debug.traceback("", 2 + localClassTraceOffset)
+	function PackageManager:_GetLocalPackage(apiCallTraceOffset)
+		local trace = debug.traceback("", 2 + apiCallTraceOffset)
 
 		local lastLine = string.match(trace, "[^\n]+%s*$")
 		lastLine = string.gsub(lastLine, "\n", "")
 
-		local names = {}
-		for substring in string.gmatch(lastLine, "[^.]+") do
-			table.insert(names, substring)
+		-- Check if the last name is the main script (root package condition)
+		local scriptPath = string.match(lastLine, "(.*):%d+$")
+		if scriptPath and scriptPath == self.MainScriptPath then
+			return self.RootPackage
 		end
 
-		local scriptName = string.match(names[#names], "(.*):%d+$")
-		if scriptName and scriptName == self.MainScriptName then
-			return self.RootPackage
+		local inClassesScriptPath
+		local rootFolderNames = self.RootFolderPaths
+		for _, path in next, rootFolderNames do
+			if string.sub(scriptPath, 1, #path) == path then
+				-- step to the next character; plus skipping '.' 
+				inClassesScriptPath = string.sub(scriptPath, #path + 2, -1)
+				break
+			end
+		end
+
+		local names = {}
+		for substring in string.gmatch(inClassesScriptPath, "[^.]+") do
+			table.insert(names, substring)
 		end
 
 		-- last line is running class
 		table.remove(names)
 
-		for i = #names, 1, -1 do
-			local potentialPackageName = names[i]
+		local currentPackage = self.RootPackage
 
-			for rootName in next, rootFolderNames do
-				if potentialPackageName == rootName then
-					return self.RootPackage
-				end 
-			end
-
-			local package = self:GetPackage(potentialPackageName, true)
-			if package then
-				return package
+		for _, name in next, names do
+			local subPackage = currentPackage:FindSubPackage(name)
+			if subPackage then
+				currentPackage = subPackage
 			end
 		end
 
-		errorf("cannot extract package name from trace '%s'", lastLine)
+		return currentPackage
 	end
 
 end
 
 local Kernel = {} do
 	Kernel.__index = Kernel
-	
+
 	function Kernel.new(
 		classesFolders : {Instance},
 		librariesFolders : {Instance},
 		mainScript : ModuleScript
 	)
 		local self = setmetatable({}, Kernel)
-		
+
 		expectrbxtype(classesFolders, "table")
 		expectrbxtype(librariesFolders, "table")
 		expectrbxtype(mainScript, "Instance")
@@ -509,7 +508,7 @@ local Kernel = {} do
 			expectrbxtype(libraryFolder, "Instance")
 			libraryCollector:Collect(libraryFolder)
 		end
-		
+
 		return self
 	end
 
@@ -522,13 +521,13 @@ local Kernel = {} do
 	end
 
 	local expectclasstype = baseLibrary.expectclasstype
-	
+
 	function Kernel:_CheckFinalization(actionName : string)
 		if self._Finalized then
 			error(`cannot {actionName} after finalization`)
 		end
 	end
-	
+
 	function Kernel:GetClass(path : string)
 		expecttype(path, "string")
 		self:_CheckFinalization("import")
@@ -549,7 +548,7 @@ local Kernel = {} do
 
 	function Kernel:FinalizeClasses()
 		self:_CheckFinalization("finalize")
-		
+
 		for packageName, package in next, self._PackageManager.Packages do
 
 			for moduleName, implementationModule in next, package._ModuleNameToImplementation do
