@@ -38,7 +38,7 @@ local Module = {} do
 		if self._IsInitialized then
 			return self._ReturnValue
 		end
-
+		
 		local result = require(self._Instance)
 		if type(result) ~= "table" then
 			error(`expected 'table' value to be returned, got '{type(result)}'\nfrom module '{self._Instance:GetFullName()}'`)
@@ -67,10 +67,10 @@ local ModuleCollector = {} do
 	function ModuleCollector:AddModule(name : string, module)
 		local existing = self.CollectedModules[name]
 		if existing then
-			errorf("cannot register files with the same name '%s':\nregistered: %s,n\new: %s",
+			errorf("cannot register files with the same name '%s':\nregistered: %s,\nnew: %s",
 				name,
 				existing._Instance:GetFullName(),
-				module:GetFullName()
+				module._Instance:GetFullName()
 			)
 		end
 
@@ -444,7 +444,7 @@ local PackageManager = {} do
 		local rootFolderNames = self.RootFolderPaths
 		for _, path in next, rootFolderNames do
 			if string.sub(scriptPath, 1, #path) == path then
-				-- step to the next character; plus skipping '.' 
+				-- step to the next character; plus skipping '.'
 				inClassesScriptPath = string.sub(scriptPath, #path + 2, -1)
 				break
 			end

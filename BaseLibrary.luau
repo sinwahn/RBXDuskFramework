@@ -89,12 +89,10 @@ local function getcallstacksize(step)
 	return high - 1
 end
 
-local CLASS_OWN_MEMBERS = "__members"
 local CLASS_BASE = "__base"
 local CLASS_TYPENAME = "__type"
 local CLASS_ID = "__id"
-local CLASS_MEMBER_ATTRIBUTES = "__member_attriutes"
-local CLASS_ATTRIBUTES = "__class_attriutes"
+local CLASS_BUILDER = "__builder"
 
 local CLASS_CONSTRUCTOR = "constructor"
 local CLASS_DESTRUCTOR = "destructor"
@@ -108,8 +106,12 @@ local function getDebugInfo(method)
 	return `{source}:{line}`
 end
 
+local function formatMemberReference(class, memberName)
+	return `{rawget(class, CLASS_TYPENAME)}.{memberName}`
+end
+
 local function getFullDebugInfo(class, methodName)
-	return `'{rawget(class, CLASS_TYPENAME)}.{methodName}' ({getDebugInfo(rawget(class, methodName))})`
+	return `'{formatMemberReference(class, methodName)}' ({getDebugInfo(rawget(class, methodName))})`
 end
 
 
@@ -149,7 +151,7 @@ local function removeindex(array, item)
 end
 
 local function removeindexthrow(array, item)
-	assert(select('#', removeindex(array, item)) > 0, "invalid item index")
+	assert(removeindex(array, item) ~= nil, "invalid item index")
 	return item -- table.remove would return passed
 end
 
@@ -293,9 +295,9 @@ do
 			for i, v in next, t do
 				outputFunction(tab, i, formatvalue(v))
 				if type(v) == "table" then
-					layer = layer + 1
+					layer += 1
 					printl(v)
-					layer = layer - 1
+					layer -= 1
 				end
 			end
 		end
@@ -316,6 +318,26 @@ do
 		end
 	end
 
+end
+
+local function expandedFormat(...)
+	local result = ""
+	expandedOutput(function(...)
+		local argCount = select("#", ...)
+		if argCount == 0 then
+			result ..= "\n"
+		else
+			local v = ...
+			result ..= tostring(v)
+
+			for i = 2, argCount do
+				local v = select(i, ...)
+				result ..= " " .. tostring(v)
+			end
+		end
+	end, ...)
+
+	return result
 end
 
 local function printe(...)
@@ -401,11 +423,6 @@ local AttributeType do
 		AttributeType[value] = name
 	end
 end
-
-local function hasClassAttribute(class, name)
-	return rawget(class, CLASS_ATTRIBUTES)[name]
-end
-
 
 local classToIdMap = {}
 local classToNameMap = {}
@@ -552,6 +569,7 @@ local function iterateClassMethods(class)
 end
 
 local emptyFunction = function()end
+local declaredFunction = function()end
 
 local ClassBuilder do
 
@@ -560,51 +578,46 @@ local ClassBuilder do
 
 	local pureVirtualMethodCallError = kernelSettings.PureVirtualMethodCallError
 
-	local function createPureVirtualMethodHandler(class, memberName)
-		local function pureVirtualMethodHandler(self)
-			local message = string.format("attempt to call pure virtual method %s for class '%s'",
-				getFullDebugInfo(class, memberName), self.__type)
-
-			if pureVirtualMethodCallError then
-				error(message)
-			else
-				warn(debug.traceback(message))
-			end
-		end
-		return pureVirtualMethodHandler
-	end
-
 	local attributePrefix = "__attr_"
 	local function isAttribute(name)
 		return string.sub(name, 1, #attributePrefix) == attributePrefix
 	end
-	
+
+	local function getBuilder(class)
+		return rawget(class, CLASS_BUILDER)
+	end
+
+	local globPureVirtualMethodMap = {}
+
 	ClassBuilder = {} do
 		ClassBuilder.__index = ClassBuilder
 
 		function ClassBuilder.new(class, className, classId)
 			local self = setmetatable({}, ClassBuilder)
-			
+
 			self.Class = class
 			self.ClassName = className
 			self.ClassId = classId
-			
+
 			self.MemberAttributes = {}
 			self.ClassAttributes = {}
 			self.OwnMembers = {}
 			self.Destructors = {}
 			self.MethodToImplementation = {}
+			self.Derived = {}
+
 			self.ObjectCreator = emptyFunction
+			self.OriginalMetatable = getmetatable(class)
 			
 			return self
 		end
 
-		function ClassBuilder.HasClassAttribute(class, name)
-			return rawget(class, CLASS_ATTRIBUTES)[name]
+		function ClassBuilder:HasClassAttribute(name)
+			return self.ClassAttributes[name]
 		end
 
-		function ClassBuilder.HasMemberAttribute_attributes(attributes, memberName, type)
-			local memberAttributes = attributes[memberName]
+		function ClassBuilder:HasMemberAttribute(memberName, type)
+			local memberAttributes = self.MemberAttributes[memberName]
 
 			if not memberAttributes then
 				return false
@@ -613,13 +626,25 @@ local ClassBuilder do
 			return not not memberAttributes[type]
 		end
 
-		function ClassBuilder.HasMemberAttribute(class, memberName, type)
-			local attributes = rawget(class, CLASS_MEMBER_ATTRIBUTES)
-			if not attributes then
-				return false
+		function ClassBuilder:CreatePureVirtualMethodHandler(memberName, dummyMethod)
+			local originalClass = self.Class
+			local function pureVirtualMethodHandler(self)
+				local message = `attempt to call pure virtual method '%s' for class '%s',\noriginal dummy method is at %s`
+				message = string.format(message,
+					memberName,
+					self.__type,
+					getFullDebugInfo(originalClass, memberName)
+				)
+
+				if pureVirtualMethodCallError then
+					error(message)
+				else
+					warn(debug.traceback(message))
+				end
 			end
 
-			return ClassBuilder.HasMemberAttribute_attributes(attributes, memberName, type)
+			globPureVirtualMethodMap[pureVirtualMethodHandler] = dummyMethod
+			return pureVirtualMethodHandler
 		end
 
 		function ClassBuilder:SetIndex()
@@ -632,7 +657,7 @@ local ClassBuilder do
 
 		local function collectInherited(result, currentClass)
 			local baseClasses = rawget(currentClass, CLASS_BASE)
-			
+
 			for _, baseClass in next, baseClasses do
 				if table.find(result, baseClass) then continue end
 
@@ -640,7 +665,7 @@ local ClassBuilder do
 					local myType = rawget(currentClass, CLASS_TYPENAME)
 					error(`'{CLASS_TYPENAME}' items of '{myType}' must be built classes, got '{type(baseClass)}'`)
 				end
-				
+
 				collectInherited(result, baseClass)
 				table.insert(result, baseClass)
 			end
@@ -669,20 +694,8 @@ local ClassBuilder do
 			return allInheritedClasses
 		end
 
-		local function importCreatorGuard(...)
-			error("cannot create class object before finalization")
-		end
-		local function importDestructorGuard(...)
-			error("cannot destroy class object before finalization")
-		end
-
-		local function raiseReservedMethodDeclarationError(class, memberName)
-			print("declaration at", getFullDebugInfo(class, memberName), class)
-			error(`cannot define reserved '{memberName}()'`)
-		end
-		
 		function ClassBuilder:ProcessInheritance()
-			local class = self.Class
+			local myClass = self.Class
 			local allInheritedClasses = self:CollectInheritedClasses()
 
 			local inheritedVirtualMethods = {}
@@ -694,11 +707,15 @@ local ClassBuilder do
 			-- move inherited methods to vtable and collect destructors
 			for _, baseClass in next, allInheritedClasses do
 
+				local baseClassBuilder = getBuilder(baseClass)
+
+				table.insert(baseClassBuilder.Derived, myClass)
+
 				if logClassBuildingProcess then
-					print("\t inheriting", rawget(baseClass, CLASS_TYPENAME))
+					print("\t inheriting", baseClassBuilder.ClassName)
 				end
 
-				for memberName, member in next, rawget(baseClass, CLASS_OWN_MEMBERS) do
+				for memberName, member in next, baseClassBuilder.OwnMembers do
 
 					if memberName == CLASS_CONSTRUCTOR
 						or string.sub(memberName, 1, 2) == "__"
@@ -711,14 +728,14 @@ local ClassBuilder do
 						continue
 					end
 
-					if self.HasMemberAttribute(baseClass, memberName, AttributeType.Virtual) then
+					if baseClassBuilder:HasMemberAttribute(memberName, AttributeType.Virtual) then
 						inheritedVirtualMethods[memberName] = true
 					end
 
-					if class[memberName] and not inheritedVirtualMethods[memberName] then
+					if myClass[memberName] and not inheritedVirtualMethods[memberName] then
 						print("inheritedVirtualMethods", inheritedVirtualMethods)
 						print("attempted to override", getFullDebugInfo(baseClass, memberName), baseClass)
-						print("attempted to override with", getFullDebugInfo(class, memberName), class)
+						print("attempted to override with", getFullDebugInfo(myClass, memberName), myClass)
 						error(`cannot override non-virtual method '{memberName}'`)
 					end
 
@@ -731,7 +748,7 @@ local ClassBuilder do
 						end
 					end
 
-					rawset(class, memberName, member)
+					rawset(myClass, memberName, member)
 				end
 
 			end
@@ -741,95 +758,42 @@ local ClassBuilder do
 					if logClassBuildingProcess then
 						warn(`\t overriding {memberName}`)
 					end
-					rawset(class, memberName, member)
+					rawset(myClass, memberName, member)
 				end
 			end
-		end
-
-		function ClassBuilder:HandleObjectCreators()
-			local class = self.Class
-
-			local constructor = class[CLASS_CONSTRUCTOR] or emptyFunction
-
-			if debugModeEnabled or kernelSettings.SelfArgumentValidationInConstructors then
-
-				local function baseTableClassSearch(baseClasses, classToFind)
-					for _, baseClass in next, baseClasses do
-						if baseClass == classToFind then
-							return baseClass
-						else
-							local foundClass = baseTableClassSearch(rawget(baseClass, CLASS_BASE), classToFind)
-							if foundClass then
-								return foundClass
-							end
-						end
-					end
-				end
-
-				local originalConstructor = constructor
-				constructor = function(self, ...)
-					expectclass(self)
-
-					-- check if we are calling constructor with self of it's own class or derived one
-					local myClass = getmetatable(self)
-					if getmetatable(self) == class
-						or baseTableClassSearch(rawget(myClass, CLASS_BASE), class)
-					then
-						originalConstructor(self, ...)
-					else
-						print("passed class:", myClass)
-						print("expected class:", class)
-						error("'self' class is unrelated to the class of the calling constructor")
-					end
-				end
-			end
-
-			if constructor then
-				self.ObjectCreator = function(...)
-					local object = setmetatable({}, class)
-					assert(select('#', constructor(object, ...)) == 0, "constructor cannot return anything")
-					return object
-				end
-			else
-				self.ObjectCreator = function()
-					return setmetatable({}, class)
-				end
-			end
-
-			class[CLASS_CONSTRUCTOR] = constructor
 		end
 
 		local instanceIndex = 0
 		function ClassBuilder:HandleDebug()
 			if not debugModeEnabled then return end
 
-			local class = self.Class
+			local myClass = self.Class
 
 			local debugModeSettings = kernelSettings.DebugMode
 
 			if debugModeSettings.AddTostringMetamethod then
-				local currentTostring = rawget(class, "__tostring")
+				local currentTostring = rawget(myClass, "__tostring")
 				if currentTostring == nil then
 					local function __tostring(self)
 						return tostring(rawget(self, INSTANCE_ID) .. "_" .. rawget(self, CLASS_TYPENAME))
 					end
-					rawset(class, "__tostring", __tostring)
+					rawset(myClass, "__tostring", __tostring)
 				end
 			end
 
-			for memberName, memberFunction in iterateClassMethods(class) do
+			for memberName, memberFunction in iterateClassMethods(myClass) do
 
 				local finalMemberFunction = memberFunction
 
 				if memberName == CLASS_OBJECT_CREATOR then
-					class[memberName] = function(...)
+					myClass[memberName] = function(...)
 						local instance = finalMemberFunction(...)
 						rawset(instance, INSTANCE_ID, instanceIndex)
 						instanceIndex += 1
 						return instance
 					end
 				else
-					rawset(class, memberName, finalMemberFunction)
+					rawset(myClass, memberName, finalMemberFunction)
 				end
 			end
 
@@ -843,13 +807,13 @@ local ClassBuilder do
 				baseClasses = {}
 				rawset(class, CLASS_BASE, baseClasses)
 			else
-				
+
 				if not istype(baseClasses, "table") then
 					error(`reserved '{CLASS_TYPENAME}' field of '{self.ClassName}' must be a table`)
 				end
-				
+
 			end
-			
+
 			table.move(additionalBaseClasses, 1, #additionalBaseClasses, #baseClasses, baseClasses)
 
 			for _, baseClass in next, baseClasses do
@@ -931,15 +895,25 @@ local ClassBuilder do
 
 		local attributeInfo do
 
+			local function getReferredMethod(classBuilder, memberName)
+				local method = classBuilder.Class[memberName]
+				if not method then
+					error(`cannot declare method, member name '{memberName}' is invalid`)
+				end
+				return method
+			end
+
 			local function pureVirtualHandler(classBuilder, memberName)
-				local handler = createPureVirtualMethodHandler(classBuilder.Class, memberName)
+				local method = getReferredMethod(classBuilder, memberName)
+				local handler = classBuilder:CreatePureVirtualMethodHandler(memberName, method)
 				classBuilder:AddOwnMember(memberName, handler)
 				classBuilder:HandleAttribute({AttributeType.Virtual, memberName}, true)
-				classBuilder:RegisterDeclaration(classBuilder.Class[memberName])
+				classBuilder:RegisterPureVirtual(method, memberName, handler)
 			end
 
 			local function declarationHandler(classBuilder, memberName)
-				classBuilder:RegisterDeclaration(classBuilder.Class[memberName])
+				local method = getReferredMethod(classBuilder, memberName)
+				classBuilder:RegisterDeclaration(method, memberName)
 			end
 
 			attributeInfo = {
@@ -1034,13 +1008,13 @@ local ClassBuilder do
 
 			for memberName, methodOrValue in next, class do
 				if memberName == CLASS_BASE then continue end
-				
+
 				if isAttribute(memberName) then
 					self:HandleAttributeField(memberName, methodOrValue)
 				else
 
-					if not self.HasMemberAttribute_attributes(self.MemberAttributes,
-						memberName, AttributeType.PureVirtualVirtual)
+					if not self:HasMemberAttribute(memberName,
+						AttributeType.PureVirtualVirtual)
 					then
 						self:AddOwnMember(memberName, methodOrValue)
 					end
@@ -1058,27 +1032,43 @@ local ClassBuilder do
 
 		function ClassBuilder:AssignClassBuildInfo()
 			local class = self.Class
-			rawset(class, CLASS_OWN_MEMBERS, self.OwnMembers)
 			rawset(class, CLASS_TYPENAME, self.ClassName)
 			rawset(class, CLASS_ID, self.ClassIdCounter)
-			rawset(class, CLASS_MEMBER_ATTRIBUTES, self.MemberAttributes)
-			rawset(class, CLASS_ATTRIBUTES, self.ClassAttributes)
+			rawset(class, CLASS_BUILDER, self)
 		end
 
-		function ClassBuilder.RemoveBuildInfo(class)
+		function ClassBuilder:RemoveBuildInfo()
 			if not (debugModeEnabled or kernelSettings.SelfArgumentValidationInConstructors) then
+				local class = self.Class
+				rawset(class, CLASS_ID, nil)
 				rawset(class, CLASS_BASE, nil)
+				rawset(class, CLASS_BUILDER, nil)
 			end
-
-			rawset(class, CLASS_OWN_MEMBERS, nil)
-			rawset(class, CLASS_MEMBER_ATTRIBUTES, nil)
-			rawset(class, CLASS_ATTRIBUTES, nil)
 		end
 
+		local function importCreatorGuard(...)
+			error("cannot create class object before finalization")
+		end
+		local function importDestructorGuard(...)
+			error("cannot destroy class object before finalization")
+		end
+		
+		local metatableGuard = {}
+		function metatableGuard:__newindex(key, value)
+			error(`trying to assign '{key}' to the settled '{getBuilder(self).ClassName}' class during building phase`)
+		end
+		
 		function ClassBuilder:SetImportPhaseGuards()
 			local class = self.Class
 			rawset(class, CLASS_OBJECT_CREATOR, importCreatorGuard)
 			rawset(class, CLASS_OBJECT_DESTRUCTOR, importDestructorGuard)
+			setmetatable(class, metatableGuard)
+		end
+
+		function ClassBuilder:RaiseReservedMethodDeclarationError(memberName)
+			local class = self.Class
+			print("declaration at", getFullDebugInfo(class, memberName), class)
+			error(`cannot define reserved '{memberName}()'`)
 		end
 		
 		function ClassBuilder:ValidateReservedMembers()
@@ -1086,15 +1076,15 @@ local ClassBuilder do
 
 			local member = rawget(class, CLASS_OBJECT_CREATOR)
 			if member and member ~= importCreatorGuard then
-				raiseReservedMethodDeclarationError(class, CLASS_OBJECT_CREATOR)
+				self:RaiseReservedMethodDeclarationError(CLASS_OBJECT_CREATOR)
 			end
 
 			local member = rawget(class, CLASS_OBJECT_DESTRUCTOR)
 			if member and member ~= importDestructorGuard then
-				raiseReservedMethodDeclarationError(class, CLASS_OBJECT_DESTRUCTOR)
+				self:RaiseReservedMethodDeclarationError(CLASS_OBJECT_DESTRUCTOR)
 			end
 		end
-		
+
 		function ClassBuilder:Build(additionalBaseClasses)
 			self:RegisterOwnMembersAndAttributes()
 			self:AssignClassBuildInfo()
@@ -1111,21 +1101,121 @@ local ClassBuilder do
 			classToIdMap[self.Class] = self.ClassId
 			classToNameMap[self.Class] = self.ClassName
 		end
-		
-	
-		function ClassBuilder:RegisterDeclaration(method)
-			self.MethodToImplementation[method] = emptyFunction
+
+
+		function ClassBuilder:RegisterDeclaration(method, methodName)
+			if self.MethodToImplementation[method] then
+				error(`duplicate declaration of '{methodName}': last: {getFullDebugInfo(self.Class, methodName)}\n new: {getDebugInfo(method)}`)
+			end
+			self.MethodToImplementation[method] = declaredFunction
 		end
 
-		function ClassBuilder:RegisterImplementation(method, implementation)
+		function ClassBuilder:RegisterPureVirtual(method, methodName, handler)
+			if self.MethodToImplementation[method] then
+				error(`duplicate declaration of '{methodName}': last: {getFullDebugInfo(self.Class, methodName)}\n new: {getDebugInfo(method)}`)
+			end
+			self.MethodToImplementation[method] = handler
+		end
+
+		function ClassBuilder:RegisterImplementation(method, implementation, methodName)
+			local exisitngImplementation = self.MethodToImplementation[method]
+			if exisitngImplementation
+				and exisitngImplementation ~= exisitngImplementation
+				and exisitngImplementation ~= declaredFunction then
+				error(`duplicate implementation of '{methodName}': last: {getFullDebugInfo(self.Class, methodName)}\n new: {getDebugInfo(method)}`)
+			end
 			self.MethodToImplementation[method] = implementation
 		end
 
+		function ClassBuilder:FindUnimplementedPureVirtualMethods()
+			local result = {}
+			for name, member in next, self.Class do
+				local dummy = globPureVirtualMethodMap[member]
+				if dummy then
+					result[name] = dummy
+				end
+			end
+			return result
+		end
+
+		function ClassBuilder:FinalizeObjectCreators()
+			local myClass = self.Class
+
+			local constructor = rawget(myClass, CLASS_CONSTRUCTOR) or emptyFunction
+
+			if debugModeEnabled or kernelSettings.SelfArgumentValidationInConstructors then
+
+				local function baseTableClassSearch(derivedClasses, classToFind)
+					for _, baseClass in next, derivedClasses do
+						if baseClass == classToFind then
+							return baseClass
+						else
+							local foundClass = baseTableClassSearch(rawget(baseClass, CLASS_BASE), classToFind)
+							if foundClass then
+								return foundClass
+							end
+						end
+					end
+				end
+
+				local originalConstructor = constructor
+				constructor = function(self, ...)
+					expectclass(self)
+
+					-- check if we are calling constructor with self of it's own class or derived one
+					local myClass = getmetatable(self)
+					if getmetatable(self) == myClass
+						or baseTableClassSearch(rawget(myClass, CLASS_BASE), myClass)
+					then
+						originalConstructor(self, ...)
+					else
+						print("passed class:", myClass)
+						print("expected class:", myClass)
+						error("'self' class is unrelated to the class of the calling constructor")
+					end
+				end
+			end
+
+			local purevirtuals = self:FindUnimplementedPureVirtualMethods()
+
+			if next(purevirtuals) then
+				self.ObjectCreator = function(...)
+					warn("unresolved methods:")
+					for name, dummy in next, purevirtuals do
+						warn(`pure virtual method '{name}' at '{getDebugInfo(dummy)}'`)
+					end
+					error(`cannot create instance of abstract class '{self.ClassName}'`)
+				end
+			else
+				if constructor then
+					self.ObjectCreator = function(...)
+						local object = setmetatable({}, myClass)
+						assert(select('#', constructor(object, ...)) == 0, "constructor cannot return anything")
+						return object
+					end
+				else
+					self.ObjectCreator = function()
+						return setmetatable({}, myClass)
+					end
+				end
+			end
+
+			myClass[CLASS_CONSTRUCTOR] = constructor
+
+		end
+		
+		function ClassBuilder:RemoveImportGuards()
+			local class = self.Class
+			setmetatable(class, self.OriginalMetatable)
+		end
+		
 		function ClassBuilder:Finalize()
+			self:RemoveImportGuards()
+			
 			local class = self.Class
 			local methodToImplementation = self.MethodToImplementation
 
-			local unresolvedMethodImplementation = false
+			local hasUnresolvedMethodImplementation = false
 
 			for methodName, method in iterateClassMethods(class) do
 				if methodName == CLASS_OBJECT_CREATOR
@@ -1137,12 +1227,10 @@ local ClassBuilder do
 				local implementation = methodToImplementation[method]
 				if not implementation then continue end
 
-				local isPureVirtual = self.HasMemberAttribute(class, methodName, AttributeType.PureVirtual)
+				local isPureVirtual = self:HasMemberAttribute(methodName, AttributeType.PureVirtual)
 
-				if implementation == emptyFunction and
-					not isPureVirtual
-				then
-					unresolvedMethodImplementation = true
+				if implementation == declaredFunction then
+					hasUnresolvedMethodImplementation = true
 
 					warnf("unresolved method implementation of %s",
 						getFullDebugInfo(class, methodName))
@@ -1153,31 +1241,36 @@ local ClassBuilder do
 				rawset(class, methodName, implementation)
 			end
 
-			if unresolvedMethodImplementation then
-				error("unresolved method implementation")
-			end
-			
-			self:HandleObjectCreators()
+			self:FinalizeObjectCreators()
 			self:HandleDebug()
 			self:BuildDestructor()
-			
+
 			rawset(class, CLASS_OBJECT_CREATOR, self.ObjectCreator)
-			
-			local hasNoFreeze = hasClassAttribute(class, AttributeType.NoFreeze)
-			
+
+			local hasNoFreeze = getBuilder(class):HasClassAttribute(AttributeType.NoFreeze)
+
 			if not debugModeEnabled then
-				self.RemoveBuildInfo(class)
+				self:RemoveBuildInfo()
 			end
 
 			if not hasNoFreeze then
 				table.freeze(class)
 			end
+
+			return hasUnresolvedMethodImplementation
 		end
 
 		function ClassBuilder:RegisterImplementations(originalClass, implementationMap)
 			for methodName, method in next, implementationMap do
 				local declaredMethod = rawget(originalClass, methodName)
-				self:RegisterImplementation(declaredMethod, method)
+				if not declaredMethod then
+					if type(method) == "function" then
+						error(`method '{methodName}' was not declared. implementation at: {getDebugInfo(method)}`)
+					else
+						error(`cannot register non-function member implementation '{formatMemberReference(originalClass, methodName)}'`)
+					end
+				end
+				self:RegisterImplementation(declaredMethod, method, methodName)
 			end
 		end
 
@@ -1189,7 +1282,7 @@ local buildDirector do
 
 	local BuildDirector = {} do
 		BuildDirector.__index = BuildDirector
-		
+
 		function BuildDirector.new()
 			local self = setmetatable({}, BuildDirector)
 
@@ -1201,8 +1294,14 @@ local buildDirector do
 		end
 
 		function BuildDirector:Finalize()
+			local hasUnresolvedMethod = false
 			for class, builder in next, self.ClassToBuilder do
-				builder:Finalize()
+				if builder:Finalize() then
+					hasUnresolvedMethod = true
+				end
+			end
+			if hasUnresolvedMethod then
+				error("unresolved method implementation")
 			end
 		end
 
@@ -1214,7 +1313,11 @@ local buildDirector do
 		end
 
 		function BuildDirector:RegisterImplementations(class, implementationMap)
-			self.ClassToBuilder[class]:RegisterImplementations(class, implementationMap)
+			local builder = self.ClassToBuilder[class]
+			builder:RegisterImplementations(class, implementationMap)
+			for _, derivedClass in next, builder.Derived do
+				self:RegisterImplementations(derivedClass, implementationMap)
+			end
 		end
 	end
 
@@ -1274,6 +1377,7 @@ library.printf = printf
 library.warnf = warnf
 library.errorf = errorf
 library.formatvalue = formatvalue
+library.expandedformat = expandedFormat
 library.printe = printe
 library.printl = printl
 library.warne = warne
